@@ -1,0 +1,9 @@
+{
+  "name": "maa-dashamdwar-website",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Maa Dashamdwar Manas Mandali website with Uttarakhand news ticker",
+  "dependencies": {
+    "@netlify/blobs": "^8.2.0"
+  }
+}
