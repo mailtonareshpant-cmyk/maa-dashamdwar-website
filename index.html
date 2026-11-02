@@ -194,7 +194,7 @@
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js";
 import {
-  getFirestore, collection, addDoc, getDocs, query, orderBy, serverTimestamp, deleteDoc, doc, updateDoc
+  getFirestore, collection, addDoc, getDocs, query, orderBy, serverTimestamp, deleteDoc, doc, updateDoc, setDoc
 } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js";
 import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-auth.js";
 
@@ -635,8 +635,8 @@ onAuthStateChanged(auth, user => { currentAdmin = !!user && user.uid === ADMIN_U
 loadPosts();
 loadMembers();
 
-// Donation workflow: UPI handoff is not treated as proof of payment.
-// Public entries are Pending until the existing authenticated admin confirms them.
+// Donation workflow. Public collection contains name/amount only;
+// private donations collection contains phone and is admin-readable only.
 const donationForm = document.getElementById('donationForm');
 const donorPublicList = document.getElementById('donorPublicList');
 const donationAdminPanel = document.getElementById('donationAdminPanel');
@@ -648,28 +648,30 @@ const DONATION_PAYEE = 'PREETI DIMRI';
 function moneyINR(value) {
   return '₹' + Number(value || 0).toLocaleString('en-IN');
 }
+function printDonationReceipt(d) {
+  const receiptWindow = window.open('', '_blank');
+  if (!receiptWindow) { showStatus('रसीद खोलने के लिए ब्राउज़र में पॉप-अप की अनुमति दें।', true); return; }
+  const dateText = d.confirmedAt && d.confirmedAt.toDate
+    ? d.confirmedAt.toDate().toLocaleDateString('hi-IN')
+    : 'तिथि उपलब्ध नहीं';
+  receiptWindow.document.write(`<!doctype html><html lang="hi"><meta charset="utf-8"><title>अंशदान रसीद</title><style>body{font-family:Arial,sans-serif;padding:32px;color:#302522}.receipt{max-width:620px;margin:auto;border:2px solid #8b5a36;border-radius:16px;padding:28px}h1{text-align:center;color:#70262c}p{font-size:17px;line-height:1.8}.muted{text-align:center;color:#665}</style><div class="receipt"><h1>माँ दशमद्वार मानस मंडली</h1><h2 style="text-align:center">अंशदान रसीद</h2><p>रसीद संख्या: <b>${safeText(d.receiptNo)}</b></p><p>दानदाता: <b>${safeText(d.name)}</b></p><p>अंशदान राशि: <b>${moneyINR(d.amount)}</b></p><p>भुगतान पुष्टि तिथि: <b>${safeText(dateText)}</b></p><p class="muted">मंडली के धार्मिक, सामाजिक एवं पर्यावरण संरक्षण कार्यों में सहयोग हेतु धन्यवाद।</p><p class="muted">यह रसीद Admin द्वारा भुगतान की पुष्टि के बाद जारी की गई है।</p></div><script>window.onload=()=>window.print()<\/script></html>`);
+  receiptWindow.document.close();
+}
 function safeText(value) {
   return String(value || '').replace(/[&<>"']/g, ch => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[ch]));
 }
-async function loadDonationEntries() {
+async function loadPublicDonationEntries() {
   if (!donorPublicList) return;
   try {
-    const snap = await getDocs(query(collection(db, 'donations'), orderBy('createdAt', 'desc')));
+    const snap = await getDocs(query(collection(db, 'publicDonations'), orderBy('createdAt', 'desc')));
     donorPublicList.replaceChildren();
-    const rows = [];
+    let visible = 0;
     snap.forEach(item => {
       const d = item.data();
-      if (d.status !== 'rejected') rows.push({id:item.id, ...d});
-    });
-    if (!rows.length) {
-      const p = document.createElement('p');
-      p.className = 'member-list-note';
-      p.textContent = 'अभी कोई अंशदान एंट्री उपलब्ध नहीं है।';
-      donorPublicList.append(p);
-    }
-    rows.forEach(d => {
+      if (d.status === 'rejected') return;
+      visible++;
       const row = document.createElement('div');
       row.className = 'member-entry';
       const left = document.createElement('span');
@@ -684,42 +686,63 @@ async function loadDonationEntries() {
         tag.textContent = 'पुष्टि बाकी';
         tag.style.cssText = 'display:block;width:100%;font-size:11px;color:#946200';
         row.append(tag);
+      } else if (d.status === 'confirmed' && d.receiptNo) {
+        const receiptButton = document.createElement('button');
+        receiptButton.type = 'button';
+        receiptButton.className = 'btn';
+        receiptButton.textContent = 'रसीद देखें / प्रिंट करें';
+        receiptButton.style.cssText = 'margin-top:8px;font-size:12px';
+        receiptButton.addEventListener('click', () => printDonationReceipt(d));
+        row.append(receiptButton);
       }
       donorPublicList.append(row);
     });
-    if (currentAdmin) renderDonationAdmin(rows);
+    if (!visible) {
+      const p = document.createElement('p');
+      p.className = 'member-list-note';
+      p.textContent = 'अभी कोई अंशदान एंट्री उपलब्ध नहीं है।';
+      donorPublicList.append(p);
+    }
   } catch (err) {
-    console.error('Donation list load error:', err);
-    donorPublicList.textContent = 'दानदाता सूची अभी लोड नहीं हो सकी। Firestore Rules जाँचें।';
+    console.error('Public donation list load error:', err);
+    donorPublicList.textContent = 'दानदाता सूची अभी लोड नहीं हो सकी। Firebase Rules जाँचें।';
   }
 }
-function renderDonationAdmin(rows) {
-  if (!donationAdminPanel || !donationAdminList) return;
-  donationAdminPanel.style.display = 'block';
-  donationAdminList.replaceChildren();
-  rows.filter(d => d.status === 'pending').forEach(d => {
-    const card = document.createElement('div');
-    card.className = 'member-entry';
-    card.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid #eadfce';
-    const info = document.createElement('div');
-    info.style.flex = '1';
-    info.innerHTML = `<b>${safeText(d.name)}</b><br>${moneyINR(d.amount)} · ${safeText(d.phone)}<br><small>Pending — बैंक में भुगतान जाँचें</small>`;
-    const confirm = document.createElement('button');
-    confirm.className = 'btn btn-submit';
-    confirm.type = 'button';
-    confirm.textContent = 'पुष्टि करें';
-    confirm.addEventListener('click', () => moderateDonation(d.id, 'confirmed'));
-    const reject = document.createElement('button');
-    reject.className = 'btn';
-    reject.type = 'button';
-    reject.textContent = 'अस्वीकार करें';
-    reject.addEventListener('click', () => moderateDonation(d.id, 'rejected'));
-    card.append(info, confirm, reject);
-    donationAdminList.append(card);
-  });
-  if (!rows.some(d => d.status === 'pending')) donationAdminList.textContent = 'कोई Pending अंशदान नहीं है।';
+async function loadAdminDonationEntries() {
+  if (!currentAdmin || !donationAdminPanel || !donationAdminList) return;
+  try {
+    const snap = await getDocs(query(collection(db, 'donations'), orderBy('createdAt', 'desc')));
+    const rows = [];
+    snap.forEach(item => rows.push({id:item.id, ...item.data()}));
+    donationAdminPanel.style.display = 'block';
+    donationAdminList.replaceChildren();
+    rows.filter(d => d.status === 'pending').forEach(d => {
+      const card = document.createElement('div');
+      card.className = 'member-entry';
+      card.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid #eadfce';
+      const info = document.createElement('div');
+      info.style.flex = '1';
+      info.innerHTML = `<b>${safeText(d.name)}</b><br>${moneyINR(d.amount)} · ${safeText(d.phone)}<br><small>Pending — बैंक/UPI में भुगतान जाँचें</small>`;
+      const confirmButton = document.createElement('button');
+      confirmButton.className = 'btn btn-submit';
+      confirmButton.type = 'button';
+      confirmButton.textContent = 'पुष्टि करें';
+      confirmButton.addEventListener('click', () => moderateDonation(d.id, d, 'confirmed'));
+      const rejectButton = document.createElement('button');
+      rejectButton.className = 'btn';
+      rejectButton.type = 'button';
+      rejectButton.textContent = 'अस्वीकार करें';
+      rejectButton.addEventListener('click', () => moderateDonation(d.id, d, 'rejected'));
+      card.append(info, confirmButton, rejectButton);
+      donationAdminList.append(card);
+    });
+    if (!rows.some(d => d.status === 'pending')) donationAdminList.textContent = 'कोई Pending अंशदान नहीं है।';
+  } catch (err) {
+    console.error('Admin donation load error:', err);
+    donationAdminList.textContent = 'Admin रिकॉर्ड लोड नहीं हुआ। Firebase Rules जाँचें।';
+  }
 }
-async function moderateDonation(id, status) {
+async function moderateDonation(id, donation, status) {
   if (!auth.currentUser || auth.currentUser.uid !== ADMIN_UID) {
     showStatus('अंशदान सत्यापन के लिए एडमिन लॉगिन आवश्यक है।', true);
     openAdminModal();
@@ -730,13 +753,18 @@ async function moderateDonation(id, status) {
     : 'क्या आप इस अंशदान एंट्री को अस्वीकार करना चाहते हैं?';
   if (!confirm(message)) return;
   try {
+    const publicUpdate = { status, reviewedAt: serverTimestamp() };
+    if (status === 'confirmed') {
+      publicUpdate.receiptNo = 'MMDM-' + new Date().getFullYear() + '-' + Date.now();
+      publicUpdate.confirmedAt = serverTimestamp();
+    }
     await updateDoc(doc(db, 'donations', id), {
-      status,
-      reviewedAt: serverTimestamp(),
-      reviewedBy: auth.currentUser.uid
+      status, reviewedAt: serverTimestamp(), reviewedBy: auth.currentUser.uid,
+      ...(status === 'confirmed' ? { receiptNo: publicUpdate.receiptNo } : {})
     });
+    await updateDoc(doc(db, 'publicDonations', id), publicUpdate);
     showStatus(status === 'confirmed' ? 'अंशदान सत्यापित हो गया।' : 'एंट्री अस्वीकार कर दी गई।');
-    await loadDonationEntries();
+    await Promise.all([loadPublicDonationEntries(), loadAdminDonationEntries()]);
   } catch (err) {
     console.error('Donation moderation error:', err);
     showStatus('स्थिति अपडेट नहीं हुई। Firestore Rules में Admin अनुमति जाँचें।', true);
@@ -749,37 +777,37 @@ if (donationForm) {
     const phone = document.getElementById('donorPhone').value.trim();
     const amount = Number(document.getElementById('donorAmount').value);
     const button = document.getElementById('donationSubmit');
-    if (!name || !phone || !Number.isFinite(amount) || amount < 1 || amount > 1000000) {
-      donationStatus.textContent = 'कृपया नाम, सही मोबाइल नंबर और वैध राशि भरें।';
+    if (!name || !phone || !/^[0-9+() -]{10,15}$/.test(phone) || !Number.isFinite(amount) || amount < 1 || amount > 1000000 || !Number.isInteger(amount)) {
+      donationStatus.textContent = 'कृपया नाम, सही मोबाइल नंबर और ₹1 से ₹10,00,000 तक पूर्ण रुपये में राशि भरें।';
       return;
     }
     button.disabled = true;
     donationStatus.textContent = 'अंशदान एंट्री जमा की जा रही है…';
     try {
-      await addDoc(collection(db, 'donations'), {
-        name, phone, amount, status: 'pending',
-        paymentMode: 'UPI',
+      const privateEntry = await addDoc(collection(db, 'donations'), {
+        name, phone, amount, status: 'pending', paymentMode: 'UPI',
         createdAt: serverTimestamp()
       });
+      await setDoc(doc(db, 'publicDonations', privateEntry.id), {
+        name, amount, status: 'pending', createdAt: serverTimestamp()
+      });
       const upi = `upi://pay?pa=${encodeURIComponent(DONATION_UPI_ID)}&pn=${encodeURIComponent(DONATION_PAYEE)}&am=${encodeURIComponent(amount.toFixed(2))}&cu=INR&tn=${encodeURIComponent('Maa Dashamdwar Mandali Donation')}`;
-      donationStatus.textContent = 'आपकी एंट्री Pending के रूप में जुड़ गई है। अब UPI ऐप खोलकर भुगतान करें। भुगतान पूरा करना और प्राप्तकर्ता का नाम जाँचना न भूलें।';
-      await loadDonationEntries();
+      donationStatus.textContent = 'आपकी एंट्री वेबसाइट पर Pending के रूप में जुड़ गई है। अब UPI ऐप में भुगतान करें। भुगतान पूरा करना और प्राप्तकर्ता का नाम जाँचना न भूलें।';
+      await loadPublicDonationEntries();
       window.location.href = upi;
     } catch (err) {
       console.error('Donation submission error:', err);
-      donationStatus.textContent = 'एंट्री जमा नहीं हुई। Firebase Rules में donations create अनुमति जाँचनी होगी।';
+      donationStatus.textContent = 'एंट्री पूरी तरह जमा नहीं हुई। Firebase Rules जाँचें; यदि Pending सूची में नाम दिखे तो Admin को सूचित करें।';
     } finally {
       button.disabled = false;
     }
   });
 }
-if (donationAdminPanel) {
-  onAuthStateChanged(auth, () => {
-    if (currentAdmin) loadDonationEntries();
-    else donationAdminPanel.style.display = 'none';
-  });
-}
-loadDonationEntries();
+onAuthStateChanged(auth, () => {
+  if (currentAdmin) loadAdminDonationEntries();
+  else if (donationAdminPanel) donationAdminPanel.style.display = 'none';
+});
+loadPublicDonationEntries();
 
 </script>
 <script>
